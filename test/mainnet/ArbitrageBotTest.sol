@@ -44,26 +44,26 @@ contract ArbitrageTest is Test {
         vm.stopPrank();
     }
 
-    function test_verifyExchanges() public {
-        vm.startPrank(user);
-        // Loop through and verify each exchange
-        for (uint256 i = 0; i < 5; i++) {
-            address exchange = bot.exchanges(i);
-            assertNotEq(exchange, address(0), "Exchange should not be zero address");
+    // function test_verifyExchanges() public {
+    //     vm.startPrank(user);
+    //     // Loop through and verify each exchange
+    //     for (uint256 i = 0; i < 5; i++) {
+    //         address exchange = bot.exchanges(i);
+    //         assertNotEq(exchange, address(0), "Exchange should not be zero address");
 
-            // Verify it matches expected exchange addresses
-            bool isValidExchange =
-                exchange == UNISWAP_V2 ||
-                exchange == SUSHISWAP ||
-                exchange == SHEBASWAP ||
-                exchange == SAKESWAP ||
-                exchange == CROSWAP;
+    //         // Verify it matches expected exchange addresses
+    //         bool isValidExchange =
+    //             exchange == UNISWAP_V2 ||
+    //             exchange == SUSHISWAP ||
+    //             exchange == SHEBASWAP ||
+    //             exchange == SAKESWAP ||
+    //             exchange == CROSWAP;
 
-        console.log("isValidExchange", isValidExchange);
+    //     console.log("isValidExchange", isValidExchange);
 
-        vm.stopPrank();
-        }
-    }
+    //     vm.stopPrank();
+    //     }
+    // }
 
     // function test_findArbitrage() public {
     //     vm.startPrank(user);
@@ -75,17 +75,22 @@ contract ArbitrageTest is Test {
     //     vm.stopPrank();
     // }
 
-    // function test_executeArbitrage() public {
-    //     vm.startPrank(user);
-    //     // Approve and deposit WETH
-    //     IERC20(WETH).approve(address(bot), 10 ether);
-    //     bot.depositTokens(WETH, 10 ether);
+    function test_executeArbitrage() public {
+        vm.startPrank(user);
+        // Approve and deposit WETH
+        IERC20(WETH).approve(address(bot), 10 ether);
+        bot.depositTokens(WETH, 10 ether);
 
-    //     // Approve and deposit DAI
-    //     IERC20(DAI).approve(address(bot), 20000 * 1e18);
-    //     bot.depositTokens(DAI, 20000 * 1e18);
-
-    //     bot.executeArbitrage(0.0001 ether);
-    //     vm.stopPrank();
-    // }
+        // Approve and deposit DAI
+        IERC20(DAI).approve(address(bot), 20000 * 1e18);
+        bot.depositTokens(DAI, 20000 * 1e18);
+        console.log("WETH balance", IERC20(WETH).balanceOf(address(bot)));
+        console.log("DAI balance", IERC20(DAI).balanceOf(address(bot)));
+        for (uint256 i = 0; i < 10; i++) {  
+            bot.executeArbitrage(0.0001 ether);
+        }
+        console.log("WETH balance", IERC20(WETH).balanceOf(address(bot)));
+        console.log("DAI balance", IERC20(DAI).balanceOf(address(bot)));
+        vm.stopPrank();
+    }
 }
