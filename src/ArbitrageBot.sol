@@ -6,7 +6,6 @@ import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "forge-std/console.sol";
 
 // Interface for UniswapV2 Router
 interface IUniswapV2Router02 {
@@ -16,6 +15,15 @@ interface IUniswapV2Router02 {
         address[] calldata path,
         address to,
         uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline,
+        bool ifmint
     ) external returns (uint256[] memory amounts);
 
     function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
@@ -38,12 +46,12 @@ interface IUniswapV2Pair {
 
 contract ArbitrageBot is OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable, UUPSUpgradeable {
     struct SwapParams {
-        uint256 maxDAIIn;
-        uint256 minDAIOut;
-        uint256 reserveDAIIn;
-        uint256 reserveWETHOut;
-        uint256 reserveWETHIn;
-        uint256 reserveDAIOut;
+        uint256 maxTokenIn;
+        uint256 minTokenOut;
+        uint256 reserveTokenIn;
+        uint256 reserveTokenOut;
+        uint256 reserveTokenInSell;
+        uint256 reserveTokenOutSell;
     }
 
     address public immutable WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
@@ -59,12 +67,10 @@ contract ArbitrageBot is OwnableUpgradeable, ReentrancyGuardUpgradeable, Pausabl
     address public constant CROSWAP_ROUTER = 0xCeB90E4C17d626BE0fACd78b79c9c87d7ca181b3;
 
     // Constants for slippage protection
-    uint256 public constant SLIPPAGE_TOLERANCE = 30; // 0.3% slippage tolerance
+    uint256 public constant SLIPPAGE_TOLERANCE = 20; // 0.2% slippage tolerance
 
     // Events
-    event ArbitrageExecuted(
-        address indexed exchangeBuy, address indexed exchangeSell, uint256 amountWETH, uint256 profitDAI
-    );
+    event ArbitrageExecuted(address indexed exchangeBuy, address indexed exchangeSell, uint256 amountIn);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -99,9 +105,8 @@ contract ArbitrageBot is OwnableUpgradeable, ReentrancyGuardUpgradeable, Pausabl
     // Custom errors
     error ZeroWETHReserve();
     error NoProfitableArbitrage();
-    error InsufficientDAIBalance();
-    error DAIApprovalFailed();
-    error WETHApprovalFailed();
+    error InsufficientBalance();
+    error ApprovalFailed();
     error InvalidToken();
     error TransferFailed();
     error ExchangeNotFound();
@@ -119,8 +124,8 @@ contract ArbitrageBot is OwnableUpgradeable, ReentrancyGuardUpgradeable, Pausabl
         return (reserveDAI * 1e18) / reserveWETH;
     }
 
-    /// @notice Find arbitrage opportunity across all exchanges
-    function findArbitrage()
+    /// @notice Find arbitrage opportunity for DAI profit (DAI -> WETH -> DAI)
+    function findArbitrageDAI()
         public
         view
         returns (address exchangeBuy, address exchangeSell, uint256 priceBuy, uint256 priceSell)
@@ -151,25 +156,71 @@ contract ArbitrageBot is OwnableUpgradeable, ReentrancyGuardUpgradeable, Pausabl
         return (exchangeBuy, exchangeSell, bestBuyPrice, bestSellPrice);
     }
 
+    /// @notice Find arbitrage opportunity for WETH profit (WETH -> DAI -> WETH)
+    function findArbitrageWETH()
+        public
+        view
+        returns (address exchangeBuy, address exchangeSell, uint256 priceBuy, uint256 priceSell)
+    {
+        uint256[] memory prices = new uint256[](exchanges.length);
+        for (uint256 i = 0; i < exchanges.length; i++) {
+            prices[i] = getPrice(exchanges[i]);
+        }
+
+        uint256 bestBuyPrice = 0;
+        uint256 bestSellPrice = type(uint256).max;
+
+        for (uint256 i = 0; i < prices.length; i++) {
+            uint256 price = prices[i];
+            if (price > bestBuyPrice) {
+                bestBuyPrice = price;
+                exchangeBuy = exchanges[i];
+            }
+            if (price < bestSellPrice) {
+                bestSellPrice = price;
+                exchangeSell = exchanges[i];
+            }
+        }
+        uint256 slippageAmount = (bestSellPrice * SLIPPAGE_TOLERANCE) / 10000;
+        uint256 maxBuyPrice = bestSellPrice + slippageAmount;
+        if (bestBuyPrice <= maxBuyPrice) revert NoProfitableArbitrage();
+
+        return (exchangeBuy, exchangeSell, bestBuyPrice, bestSellPrice);
+    }
+
     // ============ External Functions ============
 
-    /// @notice Execute arbitrage trade
-    function executeArbitrage(uint256 amountWETH) external onlyOwner nonReentrant whenNotPaused {
+    /// @notice Execute arbitrage trade to profit in DAI (DAI -> WETH -> DAI)
+    /// @param amountDAI Amount of DAI to use as input
+    function executeArbitrageDAI(uint256 amountDAI) external onlyOwner nonReentrant whenNotPaused {
         // Find arbitrage opportunity
-        (address exchangeBuy, address exchangeSell, uint256 priceBuy, uint256 priceSell) = findArbitrage();
-        uint256 initialDAIBalance = IERC20(DAI).balanceOf(address(this));
-        console.log("initialDAIBalance", initialDAIBalance);
-        console.log("amountWETH", IERC20(WETH).balanceOf(address(this)));
-
-        // Get router addresses for buy and sell exchanges
+        (address exchangeBuy, address exchangeSell, uint256 priceBuy, uint256 priceSell) = findArbitrageDAI();
         address routerBuy = routers[_getExchangeIndex(exchangeBuy)];
         address routerSell = routers[_getExchangeIndex(exchangeSell)];
 
+        // Log initial balances
+        uint256 initialBalance = IERC20(DAI).balanceOf(address(this));
+
         // Execute the arbitrage swaps
-        uint256 profit = _executeSwaps(exchangeBuy, exchangeSell, routerBuy, routerSell, amountWETH, initialDAIBalance);
-        console.log("after profit", IERC20(DAI).balanceOf(address(this)));
-        console.log("after amountWETH", IERC20(WETH).balanceOf(address(this)));
-        emit ArbitrageExecuted(exchangeBuy, exchangeSell, amountWETH, profit);
+        _executeSwapsDAI(exchangeBuy, exchangeSell, routerBuy, routerSell, amountDAI, initialBalance);
+
+        emit ArbitrageExecuted(exchangeBuy, exchangeSell, amountDAI);
+    }
+
+    /// @notice Execute arbitrage trade to profit in WETH (WETH -> DAI -> WETH)
+    /// @param amountWETH Amount of WETH to use as input
+    function executeArbitrageWETH(uint256 amountWETH) external onlyOwner nonReentrant whenNotPaused {
+        // Find arbitrage opportunity
+        (address exchangeBuy, address exchangeSell, uint256 priceBuy, uint256 priceSell) = findArbitrageWETH();
+        address routerBuy = routers[_getExchangeIndex(exchangeBuy)];
+        address routerSell = routers[_getExchangeIndex(exchangeSell)];
+
+        // Log initial balances
+        uint256 initialBalance = IERC20(WETH).balanceOf(address(this));
+        // Execute the arbitrage swaps
+        _executeSwapsWETH(exchangeBuy, exchangeSell, routerBuy, routerSell, amountWETH, initialBalance);
+
+        emit ArbitrageExecuted(exchangeBuy, exchangeSell, amountWETH);
     }
 
     /// @notice Deposit tokens to the contract
@@ -217,62 +268,120 @@ contract ArbitrageBot is OwnableUpgradeable, ReentrancyGuardUpgradeable, Pausabl
         revert ExchangeNotFound();
     }
 
-    /// @notice Internal function to execute the buy and sell swaps
-    function _executeSwaps(
+    /// @notice Internal function to execute swaps for DAI profit (DAI -> WETH -> DAI)
+    function _executeSwapsDAI(
+        address exchangeBuy,
+        address exchangeSell,
+        address routerBuy,
+        address routerSell,
+        uint256 amountDAI,
+        uint256 initialBalance
+    ) internal {
+        SwapParams memory params;
+
+        // Buy: DAI -> WETH
+        (uint112 reserve0Buy, uint112 reserve1Buy,) = IUniswapV2Pair(exchangeBuy).getReserves();
+        (params.reserveTokenIn, params.reserveTokenOut) =
+            IUniswapV2Pair(exchangeBuy).token0() == DAI ? (reserve0Buy, reserve1Buy) : (reserve1Buy, reserve0Buy);
+
+        // Sell: WETH -> DAI
+        (uint112 reserve0Sell, uint112 reserve1Sell,) = IUniswapV2Pair(exchangeSell).getReserves();
+        (params.reserveTokenInSell, params.reserveTokenOutSell) =
+            IUniswapV2Pair(exchangeSell).token0() == WETH ? (reserve0Sell, reserve1Sell) : (reserve1Sell, reserve0Sell);
+
+        // Calculate swap amounts
+        uint256 amountWETHOut =
+            IUniswapV2Router02(routerBuy).getAmountOut(amountDAI, params.reserveTokenIn, params.reserveTokenOut);
+        params.maxTokenIn = amountDAI;
+        params.minTokenOut = IUniswapV2Router02(routerSell).getAmountOut(
+            amountWETHOut, params.reserveTokenInSell, params.reserveTokenOutSell
+        );
+        params.minTokenOut = params.minTokenOut * (10000 - SLIPPAGE_TOLERANCE) / 10000;
+
+        // Validate and approve
+        if (IERC20(DAI).balanceOf(address(this)) < params.maxTokenIn) revert InsufficientBalance();
+        if (!IERC20(DAI).approve(routerBuy, params.maxTokenIn)) revert ApprovalFailed();
+        if (!IERC20(WETH).approve(routerSell, amountWETHOut)) revert ApprovalFailed();
+
+        // Execute swaps
+        _executeBuySwap(routerBuy, params.maxTokenIn, amountWETHOut, DAI, WETH);
+        _executeSellSwap(routerSell, amountWETHOut, params.minTokenOut, WETH, DAI);
+    }
+
+    /// @notice Internal function to execute swaps for WETH profit (WETH -> DAI -> WETH)
+    function _executeSwapsWETH(
         address exchangeBuy,
         address exchangeSell,
         address routerBuy,
         address routerSell,
         uint256 amountWETH,
-        uint256 initialDAIBalance
-    ) internal returns (uint256) {
+        uint256 initialBalance
+    ) internal {
         SwapParams memory params;
 
-        // Get reserves for buy pair (DAI -> WETH)
+        // Buy: WETH -> DAI
         (uint112 reserve0Buy, uint112 reserve1Buy,) = IUniswapV2Pair(exchangeBuy).getReserves();
-        (params.reserveDAIIn, params.reserveWETHOut) =
-            IUniswapV2Pair(exchangeBuy).token0() == DAI ? (reserve0Buy, reserve1Buy) : (reserve1Buy, reserve0Buy);
-        // Get reserves for sell pair (WETH -> DAI)
-        (uint112 reserve0Sell, uint112 reserve1Sell,) = IUniswapV2Pair(exchangeSell).getReserves();
-        (params.reserveWETHIn, params.reserveDAIOut) =
-            IUniswapV2Pair(exchangeSell).token0() == WETH ? (reserve0Sell, reserve1Sell) : (reserve1Sell, reserve0Sell);
-        // Calculate swap amounts
-        params.maxDAIIn =
-            IUniswapV2Router02(routerBuy).getAmountIn(amountWETH, params.reserveDAIIn, params.reserveWETHOut);
-        params.maxDAIIn = params.maxDAIIn * (10000 + SLIPPAGE_TOLERANCE) / 10000;
-        params.minDAIOut =
-            IUniswapV2Router02(routerSell).getAmountOut(amountWETH, params.reserveWETHIn, params.reserveDAIOut);
-        params.minDAIOut = params.minDAIOut * (10000 - SLIPPAGE_TOLERANCE) / 10000;
-        // Validate and approve
-        if (IERC20(DAI).balanceOf(address(this)) < params.maxDAIIn) revert InsufficientDAIBalance();
-        if (!IERC20(DAI).approve(routerBuy, params.maxDAIIn)) revert DAIApprovalFailed();
-        if (!IERC20(WETH).approve(routerSell, amountWETH)) revert WETHApprovalFailed();
-       
-        // Execute swaps
-        _executeBuySwap(routerBuy, params.maxDAIIn, amountWETH);
-        _executeSellSwap(routerSell, amountWETH, params.minDAIOut);
+        (params.reserveTokenIn, params.reserveTokenOut) =
+            IUniswapV2Pair(exchangeBuy).token0() == WETH ? (reserve0Buy, reserve1Buy) : (reserve1Buy, reserve0Buy);
 
-        return 0;
+        // Sell: DAI -> WETH
+        (uint112 reserve0Sell, uint112 reserve1Sell,) = IUniswapV2Pair(exchangeSell).getReserves();
+        (params.reserveTokenInSell, params.reserveTokenOutSell) =
+            IUniswapV2Pair(exchangeSell).token0() == DAI ? (reserve0Sell, reserve1Sell) : (reserve1Sell, reserve0Sell);
+
+        // Calculate swap amounts
+        uint256 amountDAIOut =
+            IUniswapV2Router02(routerBuy).getAmountOut(amountWETH, params.reserveTokenIn, params.reserveTokenOut);
+        params.maxTokenIn = amountWETH;
+        params.minTokenOut = IUniswapV2Router02(routerSell).getAmountOut(
+            amountDAIOut, params.reserveTokenInSell, params.reserveTokenOutSell
+        );
+        params.minTokenOut = params.minTokenOut * (10000 - SLIPPAGE_TOLERANCE) / 10000;
+
+        // Validate and approve
+        if (IERC20(WETH).balanceOf(address(this)) < params.maxTokenIn) revert InsufficientBalance();
+        if (!IERC20(WETH).approve(routerBuy, params.maxTokenIn)) revert ApprovalFailed();
+        if (!IERC20(DAI).approve(routerSell, amountDAIOut)) revert ApprovalFailed();
+
+        // Execute swaps
+        _executeBuySwap(routerBuy, params.maxTokenIn, amountDAIOut, WETH, DAI);
+        _executeSellSwap(routerSell, amountDAIOut, params.minTokenOut, DAI, WETH);
     }
 
     // ============ Private Functions ============
 
-    function _executeBuySwap(address router, uint256 amountIn, uint256 amountOutMin) private {
+    function _executeBuySwap(address router, uint256 amountIn, uint256 amountOutMin, address tokenIn, address tokenOut)
+        private
+    {
         address[] memory path = new address[](2);
-        path[0] = DAI;
-        path[1] = WETH;
-        IUniswapV2Router02(router).swapExactTokensForTokens(
-            amountIn, amountOutMin, path, address(this), block.timestamp + 300
-        );
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+        if (router == SAKESWAP_ROUTER) {
+            IUniswapV2Router02(router).swapExactTokensForTokens(
+                amountIn, amountOutMin, path, address(this), block.timestamp + 300, false
+            );
+        } else {
+            IUniswapV2Router02(router).swapExactTokensForTokens(
+                amountIn, amountOutMin, path, address(this), block.timestamp + 300
+            );
+        }
     }
 
-    function _executeSellSwap(address router, uint256 amountIn, uint256 amountOutMin) private {
+    function _executeSellSwap(address router, uint256 amountIn, uint256 amountOutMin, address tokenIn, address tokenOut)
+        private
+    {
         address[] memory path = new address[](2);
-        path[0] = WETH;
-        path[1] = DAI;
-        IUniswapV2Router02(router).swapExactTokensForTokens(
-            amountIn, amountOutMin, path, address(this), block.timestamp + 300
-        );
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+        if (router == SAKESWAP_ROUTER) {
+            IUniswapV2Router02(router).swapExactTokensForTokens(
+                amountIn, amountOutMin, path, address(this), block.timestamp + 300, false
+            );
+        } else {
+            IUniswapV2Router02(router).swapExactTokensForTokens(
+                amountIn, amountOutMin, path, address(this), block.timestamp + 300
+            );
+        }
     }
 
     /// @notice Authorize contract upgrade
